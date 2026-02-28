@@ -8,11 +8,36 @@ from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 
 
 # =============================================================================
+# HELPER FUNCTIONS (AABB Collision)
+# =============================================================================
+def smooth_abs(x, eps=1e-9):
+    return ca.sqrt(x * x + eps)
+
+
+def smooth_relu(x, eps=1e-9):
+    return 0.5 * (x + ca.sqrt(x * x + eps))
+
+
+def dist_to_aabb(point, center, half_sizes):
+    """
+    Distance from point to an axis-aligned box (AABB).
+    = 0 if inside the box, > 0 if outside.
+    """
+    d = smooth_abs(point - center) - half_sizes
+    dpos = ca.vertcat(
+        smooth_relu(d[0]),
+        smooth_relu(d[1]),
+        smooth_relu(d[2])
+    )
+    return ca.sqrt(dpos[0] ** 2 + dpos[1] ** 2 + dpos[2] ** 2 + 1e-12)
+
+
+# =============================================================================
 # CAR TRAJECTORY GENERATOR
 # =============================================================================
 def generate_car_trajectory(t_eval):
-    V_STRAIGHT = 2.5
-    V_CORNER = 0.5
+    V_STRAIGHT = 8
+    V_CORNER = 2
     TRACK_W = 4.0
     TRACK_H = 6.0
     CORNER_R = 3.0
@@ -105,21 +130,30 @@ def create_hl_kinematic_model():
     y_loc = -ca.sin(c_yaw) * dx + ca.cos(c_yaw) * dy
     z_loc = dz
 
-    # Obstacle Field for the 5 Closed Walls
-    eps = 1e-4
+    # Hollow moving box as 5 WALL AABBs (open face = -x)
+    L, W, H = 1.5, 1.5, 1.5
+    hx, hy, hz = L / 2, W / 2, H / 2
+    wall_t = 0.06
+    r_safe = 0.25
 
-    vy_dist = y_loc ** 2 - 0.25
-    smax_y = 0.5 * (vy_dist + ca.sqrt(vy_dist ** 2 + eps))
+    # Convert to cube-center frame
+    q = ca.vertcat(x_loc, y_loc, z_loc + hz)
 
-    vz_dist = (z_loc + 0.75) ** 2 - 0.49
-    smax_z = 0.5 * (vz_dist + ca.sqrt(vz_dist ** 2 + eps))
+    walls = [
+        (ca.vertcat(hx + wall_t / 2, 0, 0), ca.vertcat(wall_t / 2, hy, hz)),  # +x
+        (ca.vertcat(0, hy + wall_t / 2, 0), ca.vertcat(hx, wall_t / 2, hz)),  # +y
+        (ca.vertcat(0, -hy - wall_t / 2, 0), ca.vertcat(hx, wall_t / 2, hz)),  # -y
+        (ca.vertcat(0, 0, hz + wall_t / 2), ca.vertcat(hx, hy, wall_t / 2)),  # +z
+        (ca.vertcat(0, 0, -hz - wall_t / 2), ca.vertcat(hx, hy, wall_t / 2)),  # -z
+    ]
 
-    d_out = smax_y + smax_z
+    h_list = []
+    for c_w, b_w in walls:
+        d = dist_to_aabb(q, c_w, b_w)
+        h_list.append(d - r_safe)
 
-    # Repelling Wall
-    h_wall = (x_loc + 1.0) * d_out
+    h_expr = ca.vertcat(*h_list)
 
-    h_expr = ca.vertcat(x_loc, y_loc, z_loc, h_wall)
     model.con_h_expr = h_expr
     model.con_h_expr_e = h_expr
 
@@ -158,29 +192,28 @@ def setup_hl_nmpc(model, dt, N):
     ocp.constraints.ubu = np.array([max_acc_xy, max_acc_xy, max_acc_z])
     ocp.constraints.x0 = np.zeros(nx)
 
-    # Nonlinear constraint bounds (box dimensions in car frame)
-    ocp.constraints.lh = np.array([-20.0, -0.5, -1.45, -10000.0])
-    ocp.constraints.uh = np.array([0.5, 0.5, -0.05, 0.02])
-    ocp.constraints.lh_e = np.array([-20.0, -0.5, -1.45, -10000.0])
-    ocp.constraints.uh_e = np.array([0.5, 0.5, -0.05, 0.02])
+    # 5-Wall AABB constraint bounds
+    ocp.constraints.lh = np.zeros(5)
+    ocp.constraints.uh = 1e6 * np.ones(5)
+    ocp.constraints.lh_e = np.zeros(5)
+    ocp.constraints.uh_e = 1e6 * np.ones(5)
 
-    ocp.constraints.idxsh = np.array([0, 1, 2, 3])
-    ocp.constraints.idxsh_e = np.array([0, 1, 2, 3])
+    # Soft constraints (recommended)
+    ocp.constraints.idxsh = np.arange(5)
+    ocp.constraints.idxsh_e = np.arange(5)
 
     pen_l1 = 2000.0
-    pen_wall = 10000.0
     pen_l2 = 500.0
-    pen_l2_wall = 5000.0
 
-    ocp.cost.zl = np.array([pen_l1, pen_l1, pen_l1, pen_wall])
-    ocp.cost.zu = np.array([pen_l1, pen_l1, pen_l1, pen_wall])
-    ocp.cost.Zl = np.array([pen_l2, pen_l2, pen_l2, pen_l2_wall])
-    ocp.cost.Zu = np.array([pen_l2, pen_l2, pen_l2, pen_l2_wall])
+    ocp.cost.zl = pen_l1 * np.ones(5)
+    ocp.cost.zu = pen_l1 * np.ones(5)
+    ocp.cost.Zl = pen_l2 * np.ones(5)
+    ocp.cost.Zu = pen_l2 * np.ones(5)
 
-    ocp.cost.zl_e = np.copy(ocp.cost.zl)
-    ocp.cost.zu_e = np.copy(ocp.cost.zu)
-    ocp.cost.Zl_e = np.copy(ocp.cost.Zl)
-    ocp.cost.Zu_e = np.copy(ocp.cost.Zu)
+    ocp.cost.zl_e = ocp.cost.zl.copy()
+    ocp.cost.zu_e = ocp.cost.zu.copy()
+    ocp.cost.Zl_e = ocp.cost.Zl.copy()
+    ocp.cost.Zu_e = ocp.cost.Zu.copy()
 
     ocp.parameter_values = np.zeros(4)
 
@@ -190,7 +223,6 @@ def setup_hl_nmpc(model, dt, N):
     ocp.solver_options.nlp_solver_type = 'SQP_RTI'
 
     return AcadosOcpSolver(ocp, json_file="acados_ocp_hl.json")
-
 
 # =============================================================================
 # 2. LOW-LEVEL QUADROTOR DYNAMICS (WITH HARD DYNAMIC CONSTRAINTS)
@@ -259,20 +291,32 @@ def create_quadrotor_model():
     y_loc = -ca.sin(c_yaw) * dx_val + ca.cos(c_yaw) * dy_val
     z_loc = dz_val
 
-    # Obstacle Field for the 5 Closed Walls (Top & Bottom open)
-    eps_val = 1e-4
+    # Hollow moving box as 5 WALL AABBs (open face = -x)
+    L, W, H = 1.5, 1.5, 1.5
+    hx, hy, hz = L / 2, W / 2, H / 2
+    wall_t = 0.06
+    r_safe = 0.25
 
-    vy_dist = y_loc ** 2 - 0.25
-    smax_y = 0.5 * (vy_dist + ca.sqrt(vy_dist ** 2 + eps_val))
+    # Convert to cube-center frame
+    q_val = ca.vertcat(x_loc, y_loc, z_loc + hz)
 
-    vz_dist = (z_loc + 0.75) ** 2 - 0.49
-    smax_z = 0.5 * (vz_dist + ca.sqrt(vz_dist ** 2 + eps_val))
+    walls = [
+        (ca.vertcat(hx + wall_t / 2, 0, 0), ca.vertcat(wall_t / 2, hy, hz)),  # +x
+        (ca.vertcat(0, hy + wall_t / 2, 0), ca.vertcat(hx, wall_t / 2, hz)),  # +y
+        (ca.vertcat(0, -hy - wall_t / 2, 0), ca.vertcat(hx, wall_t / 2, hz)),  # -y
+        (ca.vertcat(0, 0, hz + wall_t / 2), ca.vertcat(hx, hy, wall_t / 2)),  # +z
+        (ca.vertcat(0, 0, -hz - wall_t / 2), ca.vertcat(hx, hy, wall_t / 2)),  # -z
+    ]
 
-    d_out = smax_y + smax_z
-    h_wall = (x_loc + 1.0) * d_out  # Repelling wall formula
+    h_list = []
+    for c_w, b_w in walls:
+        d = dist_to_aabb(q_val, c_w, b_w)
+        h_list.append(d - r_safe)
 
-    model.con_h_expr = ca.vertcat(h_wall)
-    model.con_h_expr_e = ca.vertcat(h_wall)
+    h_expr = ca.vertcat(*h_list)
+
+    model.con_h_expr = h_expr
+    model.con_h_expr_e = h_expr
 
     return model
 
@@ -323,12 +367,11 @@ def setup_ll_nmpc(model, dt, N):
     ocp.constraints.x0 = np.zeros(nx)
 
     # --- IMPLEMENTING HARD NONLINEAR CONSTRAINTS ---
-    # We assign bounds directly to lh and uh without any slack variables (idxsh),
-    # making them absolute mathematical walls for the QP solver.
-    ocp.constraints.lh = np.array([-10000.0])
-    ocp.constraints.uh = np.array([0.02])
-    ocp.constraints.lh_e = np.array([-10000.0])
-    ocp.constraints.uh_e = np.array([0.02])
+    ocp.constraints.lh = np.zeros(5)
+    ocp.constraints.uh = 1e6 * np.ones(5)
+    ocp.constraints.lh_e = np.zeros(5)
+    ocp.constraints.uh_e = 1e6 * np.ones(5)
+
     ocp.parameter_values = np.zeros(4)  # Initialize dynamic parameter vector
 
     ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'
@@ -591,9 +634,9 @@ if __name__ == "__main__":
             T_pred_ll = j * dt_ll
             if abs(car_omega) > eps:
                 pred_cx = curr_target_x + (v_speed / car_omega) * (
-                            np.sin(car_yaw + car_omega * T_pred_ll) - np.sin(car_yaw))
+                        np.sin(car_yaw + car_omega * T_pred_ll) - np.sin(car_yaw))
                 pred_cy = curr_target_y + (v_speed / car_omega) * (
-                            -np.cos(car_yaw + car_omega * T_pred_ll) + np.cos(car_yaw))
+                        -np.cos(car_yaw + car_omega * T_pred_ll) + np.cos(car_yaw))
                 pred_cyaw = car_yaw + car_omega * T_pred_ll
             else:
                 pred_cx = curr_target_x + v_speed * T_pred_ll * np.cos(car_yaw)
@@ -614,9 +657,9 @@ if __name__ == "__main__":
         T_pred_ll_e = N_ll * dt_ll
         if abs(car_omega) > eps:
             pred_cx_e = curr_target_x + (v_speed / car_omega) * (
-                        np.sin(car_yaw + car_omega * T_pred_ll_e) - np.sin(car_yaw))
+                    np.sin(car_yaw + car_omega * T_pred_ll_e) - np.sin(car_yaw))
             pred_cy_e = curr_target_y + (v_speed / car_omega) * (
-                        -np.cos(car_yaw + car_omega * T_pred_ll_e) + np.cos(car_yaw))
+                    -np.cos(car_yaw + car_omega * T_pred_ll_e) + np.cos(car_yaw))
             pred_cyaw_e = car_yaw + car_omega * T_pred_ll_e
         else:
             pred_cx_e = curr_target_x + v_speed * T_pred_ll_e * np.cos(car_yaw)
