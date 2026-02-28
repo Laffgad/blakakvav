@@ -11,8 +11,8 @@ from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 # CAR TRAJECTORY GENERATOR
 # =============================================================================
 def generate_car_trajectory(t_eval):
-    V_STRAIGHT = 8
-    V_CORNER = 2
+    V_STRAIGHT = 10
+    V_CORNER = 3
     TRACK_W = 4.0
     TRACK_H = 6.0
     CORNER_R = 3.0
@@ -100,28 +100,43 @@ def create_hl_kinematic_model():
     dy = py - c_y
     dz = pz - c_z
 
+    # Drone position in Car's local frame
     x_loc = ca.cos(c_yaw) * dx + ca.sin(c_yaw) * dy
     y_loc = -ca.sin(c_yaw) * dx + ca.cos(c_yaw) * dy
     z_loc = dz
 
     eps = 1e-4
 
-    vy_bound = y_loc ** 2 - 0.25
-    smax_y = 0.5 * (vy_bound + ca.sqrt(vy_bound ** 2 + eps))
+    # =========================================================================
+    # MATHEMATICAL FUNNEL (CONE) FOR BOX ENTRANCE
+    # =========================================================================
+    # Entrance is at x_loc = -1.0. We separate x into positive/negative regions
+    # relative to the entrance using a smooth approximation.
+    x_diff = x_loc + 1.0
+    x_pos = 0.5 * (x_diff + ca.sqrt(x_diff ** 2 + eps))  # Approx max(0, x_loc + 1.0)
+    x_neg = 0.5 * (x_diff - ca.sqrt(x_diff ** 2 + eps))  # Approx min(0, x_loc + 1.0)
 
-    vz_bound = (z_loc + 0.75) ** 2 - 0.49
-    smax_z = 0.5 * (vz_bound + ca.sqrt(vz_bound ** 2 + eps))
+    # Dynamic Funnel Width & Height
+    # - If x < -1.0 (x_neg is negative): The cone opens up backwards extremely fast (1.5 slope)
+    # - If x > -1.0 (x_pos is positive): The corridor slightly tightens (0.1 slope) to avoid inside walls
+    W_y = 0.5 - 0.1 * x_pos - 1.5 * x_neg
+    W_z = 0.7 - 0.1 * x_pos - 1.5 * x_neg
 
-    d_out = smax_y + smax_z
-    h_wall = (x_loc + 1.0) * d_out
+    # Formulate 5 safe corridor constraints
+    # The drone must always stay inside this dynamic funnel.
+    h_1 = y_loc - W_y           # Right wall limit
+    h_2 = -y_loc - W_y          # Left wall limit
+    h_3 = (z_loc + 0.75) - W_z  # Bottom wall limit
+    h_4 = -(z_loc + 0.75) - W_z # Top wall limit
+    h_5 = x_loc                 # Front wall limit (Constrained in setup to <= 0.6)
 
-    h_expr = ca.vertcat(x_loc, y_loc, z_loc, h_wall)
+    h_expr = ca.vertcat(h_1, h_2, h_3, h_4, h_5)
     model.con_h_expr = h_expr
     model.con_h_expr_e = h_expr
 
     return model
 
-# по центру открытого plane коробки и back up(обЪть коробку если high level планирует сквозь коробку)
+
 def setup_hl_nmpc(model, dt, N):
     ocp = AcadosOcp()
     ocp.model = model
@@ -136,7 +151,7 @@ def setup_hl_nmpc(model, dt, N):
     ocp.cost.cost_type = 'LINEAR_LS'
     ocp.cost.cost_type_e = 'LINEAR_LS'
     ocp.cost.W = scipy.linalg.block_diag(Q, R)
-    ocp.cost.W_e = np.diag([2000, 2000, 2000, 10, 10, 10])
+    ocp.cost.W_e = np.diag([200, 200, 200, 10, 10, 10])
 
     ocp.cost.Vx = np.zeros((nx + nu, nx))
     ocp.cost.Vx[:nx, :] = np.eye(nx)
@@ -153,35 +168,37 @@ def setup_hl_nmpc(model, dt, N):
     ocp.constraints.lbu = np.array([-max_acc_xy, -max_acc_xy, -max_acc_z])
     ocp.constraints.ubu = np.array([max_acc_xy, max_acc_xy, max_acc_z])
 
-    # ==========================================
-    # NEW: Hard State Constraint on Z-axis (Index 2)
-    # ==========================================
+    # Hard State Constraint on Z-axis (Index 2)
     ocp.constraints.idxbx = np.array([2])
     ocp.constraints.lbx = np.array([-100.0])  # Unconstrained upwards
-    ocp.constraints.ubx = np.array([-0.5] ) # Strictly prevents reaching 0.5
+    ocp.constraints.ubx = np.array([-0.1])    # Strictly prevents hitting the ground
     ocp.constraints.idxbx_e = np.array([2])
     ocp.constraints.lbx_e = np.array([-100.0])
-    ocp.constraints.ubx_e = np.array([-0.5])
+    ocp.constraints.ubx_e = np.array([-0.1])
 
     ocp.constraints.x0 = np.zeros(nx)
 
-    ocp.constraints.lh = np.array([-20.0, -0.1, -1.45, -10000.0])
-    ocp.constraints.uh = np.array([-0.1, 0.1, -0.05, 0.02])
-    ocp.constraints.lh_e = np.array([-20.0, -0.1, -1.45, -10000.0])
-    ocp.constraints.uh_e = np.array([-0.5, 0.5, -0.05, 0.02])
+    # ==========================================
+    # Funnel Bounds for the 5 soft constraints
+    # ==========================================
+    # h_1 to h_4 enforce staying inside the calculated funnel width (<= 0.0)
+    # h_5 enforces staying behind the front wall (x_loc <= 0.6)
+    ocp.constraints.lh = np.array([-1000.0, -1000.0, -1000.0, -1000.0, -20.0])
+    ocp.constraints.uh = np.array([0.0, 0.0, 0.0, 0.0, 0.6])
+    ocp.constraints.lh_e = np.copy(ocp.constraints.lh)
+    ocp.constraints.uh_e = np.copy(ocp.constraints.uh)
 
-    ocp.constraints.idxsh = np.array([0, 1, 2, 3])
-    ocp.constraints.idxsh_e = np.array([0, 1, 2, 3])
+    ocp.constraints.idxsh = np.array([0, 1, 2, 3, 4])
+    ocp.constraints.idxsh_e = np.array([0, 1, 2, 3, 4])
 
-    pen_l1 = 2000.0
-    pen_wall = 10000.0
-    pen_l2 = 500.0
-    pen_l2_wall = 5000.0
+    pen_wall = 100000000.0
+    pen_l2_wall = 50000000.0
 
-    ocp.cost.zl = np.array([pen_l1, pen_l1, pen_l1, pen_wall])
-    ocp.cost.zu = np.array([pen_l1, pen_l1, pen_l1, pen_wall])
-    ocp.cost.Zl = np.array([pen_l2, pen_l2, pen_l2, pen_l2_wall])
-    ocp.cost.Zu = np.array([pen_l2, pen_l2, pen_l2, pen_l2_wall])
+    # Apply enormous penalties for stepping outside the funnel or hitting the front wall
+    ocp.cost.zl = np.array([pen_wall, pen_wall, pen_wall, pen_wall, pen_wall])
+    ocp.cost.zu = np.array([pen_wall, pen_wall, pen_wall, pen_wall, pen_wall])
+    ocp.cost.Zl = np.array([pen_l2_wall, pen_l2_wall, pen_l2_wall, pen_l2_wall, pen_l2_wall])
+    ocp.cost.Zu = np.array([pen_l2_wall, pen_l2_wall, pen_l2_wall, pen_l2_wall, pen_l2_wall])
 
     ocp.cost.zl_e = np.copy(ocp.cost.zl)
     ocp.cost.zu_e = np.copy(ocp.cost.zu)
@@ -196,7 +213,6 @@ def setup_hl_nmpc(model, dt, N):
     ocp.solver_options.nlp_solver_type = 'SQP_RTI'
 
     return AcadosOcpSolver(ocp, json_file="acados_ocp_hl.json")
-
 
 # =============================================================================
 # 2. LOW-LEVEL QUADROTOR DYNAMICS
@@ -290,11 +306,11 @@ def setup_ll_nmpc(model, dt, N):
     # ==========================================
     ocp.constraints.idxbx = np.array([2, 6, 7])
     ocp.constraints.lbx = np.array([-100.0, -max_angle, -max_angle])
-    ocp.constraints.ubx = np.array([-0.5, max_angle, max_angle])
+    ocp.constraints.ubx = np.array([-0.1, max_angle, max_angle])
 
     ocp.constraints.idxbx_e = np.array([2, 6, 7])
     ocp.constraints.lbx_e = np.array([-100.0, -max_angle, -max_angle])
-    ocp.constraints.ubx_e = np.array([-0.5, max_angle, max_angle])
+    ocp.constraints.ubx_e = np.array([-0.1, max_angle, max_angle])
 
     ocp.constraints.x0 = np.zeros(nx)
 
@@ -330,7 +346,7 @@ if __name__ == "__main__":
     target_x_full, target_y_full, target_z_full = pts[:, 0], pts[:, 1], pts[:, 2]
 
     x_current = np.zeros(12)
-    x_current[0:3] = [9, -9, -4]
+    x_current[0:3] = [-2, -2, -4]
 
     f_fun = ca.Function("f", [ll_model.x, ll_model.u], [ll_model.f_expl_expr])
 
@@ -422,7 +438,7 @@ if __name__ == "__main__":
             hl_solver.set(j, "p", np.array([pred_x, pred_y, pred_z, pred_yaw]))
 
             yref_hl = np.zeros(9)
-            yref_hl[0:3] = [pred_x, pred_y, pred_z - 0.75]
+            yref_hl[0:3] = [pred_x, pred_y, pred_z - 0.5]
             yref_hl[3:6] = [pred_vx, pred_vy, curr_vz]
             hl_solver.set(j, "yref", yref_hl)
 
@@ -443,7 +459,7 @@ if __name__ == "__main__":
         hl_solver.set(N_hl, "p", np.array([pred_x_e, pred_y_e, pred_z_e, pred_yaw_e]))
 
         yref_hl_e = np.zeros(6)
-        yref_hl_e[0:3] = [pred_x_e, pred_y_e, pred_z_e - 0.75]
+        yref_hl_e[0:3] = [pred_x_e, pred_y_e, pred_z_e - 0.5]
         yref_hl_e[3:6] = [pred_vx_e, pred_vy_e, curr_vz]
         hl_solver.set(N_hl, "yref", yref_hl_e)
 
