@@ -8,31 +8,6 @@ from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 
 
 # =============================================================================
-# HELPER FUNCTIONS (AABB Collision)
-# =============================================================================
-def smooth_abs(x, eps=1e-9):
-    return ca.sqrt(x * x + eps)
-
-
-def smooth_relu(x, eps=1e-9):
-    return 0.5 * (x + ca.sqrt(x * x + eps))
-
-
-def dist_to_aabb(point, center, half_sizes):
-    """
-    Distance from point to an axis-aligned box (AABB).
-    = 0 if inside the box, > 0 if outside.
-    """
-    d = smooth_abs(point - center) - half_sizes
-    dpos = ca.vertcat(
-        smooth_relu(d[0]),
-        smooth_relu(d[1]),
-        smooth_relu(d[2])
-    )
-    return ca.sqrt(dpos[0] ** 2 + dpos[1] ** 2 + dpos[2] ** 2 + 1e-12)
-
-
-# =============================================================================
 # CAR TRAJECTORY GENERATOR
 # =============================================================================
 def generate_car_trajectory(t_eval):
@@ -83,7 +58,7 @@ def generate_car_trajectory(t_eval):
 
     x = np.interp(t_eval, cumulative_time, raw_points[:, 0])
     y = np.interp(t_eval, cumulative_time, raw_points[:, 1])
-    z = np.full_like(x, -0.5)  # Car moves at z = -0.5
+    z = np.zeros_like(x)
 
     return np.column_stack([x, y, z])
 
@@ -125,56 +100,43 @@ def create_hl_kinematic_model():
     dy = py - c_y
     dz = pz - c_z
 
-    # Drone position in Car's local frame
     x_loc = ca.cos(c_yaw) * dx + ca.sin(c_yaw) * dy
     y_loc = -ca.sin(c_yaw) * dx + ca.cos(c_yaw) * dy
     z_loc = dz
 
-    # Hollow moving box as 5 WALL AABBs (open face = -x)
-    L, W, H = 1.5, 1.5, 1.5
-    hx, hy, hz = L / 2, W / 2, H / 2
-    wall_t = 0.06
-    r_safe = 0.25
+    eps = 1e-4
 
-    # Convert to cube-center frame
-    q = ca.vertcat(x_loc, y_loc, z_loc + hz)
+    vy_bound = y_loc ** 2 - 0.25
+    smax_y = 0.5 * (vy_bound + ca.sqrt(vy_bound ** 2 + eps))
 
-    walls = [
-        (ca.vertcat(hx + wall_t / 2, 0, 0), ca.vertcat(wall_t / 2, hy, hz)),  # +x
-        (ca.vertcat(0, hy + wall_t / 2, 0), ca.vertcat(hx, wall_t / 2, hz)),  # +y
-        (ca.vertcat(0, -hy - wall_t / 2, 0), ca.vertcat(hx, wall_t / 2, hz)),  # -y
-        (ca.vertcat(0, 0, hz + wall_t / 2), ca.vertcat(hx, hy, wall_t / 2)),  # +z
-        (ca.vertcat(0, 0, -hz - wall_t / 2), ca.vertcat(hx, hy, wall_t / 2)),  # -z
-    ]
+    vz_bound = (z_loc + 0.75) ** 2 - 0.49
+    smax_z = 0.5 * (vz_bound + ca.sqrt(vz_bound ** 2 + eps))
 
-    h_list = []
-    for c_w, b_w in walls:
-        d = dist_to_aabb(q, c_w, b_w)
-        h_list.append(d - r_safe)
+    d_out = smax_y + smax_z
+    h_wall = (x_loc + 1.0) * d_out
 
-    h_expr = ca.vertcat(*h_list)
-
+    h_expr = ca.vertcat(x_loc, y_loc, z_loc, h_wall)
     model.con_h_expr = h_expr
     model.con_h_expr_e = h_expr
 
     return model
 
-
+# по центру открытого plane коробки и back up(обЪть коробку если high level планирует сквозь коробку)
 def setup_hl_nmpc(model, dt, N):
     ocp = AcadosOcp()
     ocp.model = model
     nx = model.x.size()[0]
     nu = model.u.size()[0]
 
-    ocp.solver_options.N_horizon = N
+    ocp.dims.N = N
     ocp.solver_options.tf = N * dt
 
-    Q = np.diag([2000, 2000, 2000, 10, 10, 10])
+    Q = np.diag([200, 200, 200, 10, 10, 10])
     R = np.diag([0.1, 0.1, 0.1])
     ocp.cost.cost_type = 'LINEAR_LS'
     ocp.cost.cost_type_e = 'LINEAR_LS'
     ocp.cost.W = scipy.linalg.block_diag(Q, R)
-    ocp.cost.W_e = Q
+    ocp.cost.W_e = np.diag([2000, 2000, 2000, 10, 10, 10])
 
     ocp.cost.Vx = np.zeros((nx + nu, nx))
     ocp.cost.Vx[:nx, :] = np.eye(nx)
@@ -190,30 +152,41 @@ def setup_hl_nmpc(model, dt, N):
     ocp.constraints.idxbu = np.array([0, 1, 2])
     ocp.constraints.lbu = np.array([-max_acc_xy, -max_acc_xy, -max_acc_z])
     ocp.constraints.ubu = np.array([max_acc_xy, max_acc_xy, max_acc_z])
+
+    # ==========================================
+    # NEW: Hard State Constraint on Z-axis (Index 2)
+    # ==========================================
+    ocp.constraints.idxbx = np.array([2])
+    ocp.constraints.lbx = np.array([-100.0])  # Unconstrained upwards
+    ocp.constraints.ubx = np.array([-0.5] ) # Strictly prevents reaching 0.5
+    ocp.constraints.idxbx_e = np.array([2])
+    ocp.constraints.lbx_e = np.array([-100.0])
+    ocp.constraints.ubx_e = np.array([-0.5])
+
     ocp.constraints.x0 = np.zeros(nx)
 
-    # 5-Wall AABB constraint bounds
-    ocp.constraints.lh = np.zeros(5)
-    ocp.constraints.uh = 1e6 * np.ones(5)
-    ocp.constraints.lh_e = np.zeros(5)
-    ocp.constraints.uh_e = 1e6 * np.ones(5)
+    ocp.constraints.lh = np.array([-20.0, -0.1, -1.45, -10000.0])
+    ocp.constraints.uh = np.array([-0.1, 0.1, -0.05, 0.02])
+    ocp.constraints.lh_e = np.array([-20.0, -0.1, -1.45, -10000.0])
+    ocp.constraints.uh_e = np.array([-0.5, 0.5, -0.05, 0.02])
 
-    # Soft constraints (recommended)
-    ocp.constraints.idxsh = np.arange(5)
-    ocp.constraints.idxsh_e = np.arange(5)
+    ocp.constraints.idxsh = np.array([0, 1, 2, 3])
+    ocp.constraints.idxsh_e = np.array([0, 1, 2, 3])
 
     pen_l1 = 2000.0
+    pen_wall = 10000.0
     pen_l2 = 500.0
+    pen_l2_wall = 5000.0
 
-    ocp.cost.zl = pen_l1 * np.ones(5)
-    ocp.cost.zu = pen_l1 * np.ones(5)
-    ocp.cost.Zl = pen_l2 * np.ones(5)
-    ocp.cost.Zu = pen_l2 * np.ones(5)
+    ocp.cost.zl = np.array([pen_l1, pen_l1, pen_l1, pen_wall])
+    ocp.cost.zu = np.array([pen_l1, pen_l1, pen_l1, pen_wall])
+    ocp.cost.Zl = np.array([pen_l2, pen_l2, pen_l2, pen_l2_wall])
+    ocp.cost.Zu = np.array([pen_l2, pen_l2, pen_l2, pen_l2_wall])
 
-    ocp.cost.zl_e = ocp.cost.zl.copy()
-    ocp.cost.zu_e = ocp.cost.zu.copy()
-    ocp.cost.Zl_e = ocp.cost.Zl.copy()
-    ocp.cost.Zu_e = ocp.cost.Zu.copy()
+    ocp.cost.zl_e = np.copy(ocp.cost.zl)
+    ocp.cost.zu_e = np.copy(ocp.cost.zu)
+    ocp.cost.Zl_e = np.copy(ocp.cost.Zl)
+    ocp.cost.Zu_e = np.copy(ocp.cost.Zu)
 
     ocp.parameter_values = np.zeros(4)
 
@@ -224,8 +197,9 @@ def setup_hl_nmpc(model, dt, N):
 
     return AcadosOcpSolver(ocp, json_file="acados_ocp_hl.json")
 
+
 # =============================================================================
-# 2. LOW-LEVEL QUADROTOR DYNAMICS (WITH HARD DYNAMIC CONSTRAINTS)
+# 2. LOW-LEVEL QUADROTOR DYNAMICS
 # =============================================================================
 def create_quadrotor_model():
     model = AcadosModel()
@@ -276,48 +250,6 @@ def create_quadrotor_model():
     model.f_expl_expr = xdot
     model.f_impl_expr = model.xdot - xdot
 
-    # --- ADDING HARD CONSTRAINTS FOR CAR BOX AVOIDANCE ---
-    p_car = ca.SX.sym('p_car', 4)  # Dynamic Parameter: [car_x, car_y, car_z, car_yaw]
-    model.p = p_car
-
-    c_x, c_y, c_z, c_yaw = p_car[0], p_car[1], p_car[2], p_car[3]
-
-    dx_val = X - c_x
-    dy_val = Y - c_y
-    dz_val = Z - c_z
-
-    # Drone position in Car's local frame
-    x_loc = ca.cos(c_yaw) * dx_val + ca.sin(c_yaw) * dy_val
-    y_loc = -ca.sin(c_yaw) * dx_val + ca.cos(c_yaw) * dy_val
-    z_loc = dz_val
-
-    # Hollow moving box as 5 WALL AABBs (open face = -x)
-    L, W, H = 1.5, 1.5, 1.5
-    hx, hy, hz = L / 2, W / 2, H / 2
-    wall_t = 0.06
-    r_safe = 0.25
-
-    # Convert to cube-center frame
-    q_val = ca.vertcat(x_loc, y_loc, z_loc + hz)
-
-    walls = [
-        (ca.vertcat(hx + wall_t / 2, 0, 0), ca.vertcat(wall_t / 2, hy, hz)),  # +x
-        (ca.vertcat(0, hy + wall_t / 2, 0), ca.vertcat(hx, wall_t / 2, hz)),  # +y
-        (ca.vertcat(0, -hy - wall_t / 2, 0), ca.vertcat(hx, wall_t / 2, hz)),  # -y
-        (ca.vertcat(0, 0, hz + wall_t / 2), ca.vertcat(hx, hy, wall_t / 2)),  # +z
-        (ca.vertcat(0, 0, -hz - wall_t / 2), ca.vertcat(hx, hy, wall_t / 2)),  # -z
-    ]
-
-    h_list = []
-    for c_w, b_w in walls:
-        d = dist_to_aabb(q_val, c_w, b_w)
-        h_list.append(d - r_safe)
-
-    h_expr = ca.vertcat(*h_list)
-
-    model.con_h_expr = h_expr
-    model.con_h_expr_e = h_expr
-
     return model
 
 
@@ -327,7 +259,7 @@ def setup_ll_nmpc(model, dt, N):
     nx = model.x.size()[0]
     nu = model.u.size()[0]
 
-    ocp.solver_options.N_horizon = N
+    ocp.dims.N = N
     ocp.solver_options.tf = N * dt
 
     Q = np.diag([200, 200, 200, 20, 20, 20, 10, 10, 10, 1, 1, 1])
@@ -342,37 +274,29 @@ def setup_ll_nmpc(model, dt, N):
     ocp.cost.Vu = np.zeros((nx + nu, nu))
     ocp.cost.Vu[nx:, :] = np.eye(nu)
     ocp.cost.Vx_e = np.eye(nx)
-
     ocp.cost.yref = np.zeros(nx + nu)
     ocp.cost.yref_e = np.zeros(nx)
 
     max_thrust = 76.7636
     max_moment_x = 4.22
     max_moment_z = 0.6
-
     ocp.constraints.idxbu = np.array([0, 1, 2, 3])
     ocp.constraints.lbu = np.array([0.0, -max_moment_x, -max_moment_x, -max_moment_z])
     ocp.constraints.ubu = np.array([max_thrust, max_moment_x, max_moment_x, max_moment_z])
 
     max_angle = np.pi / 3.0
-
+    # ==========================================
+    # NEW: Include Z-axis (Index 2) alongside Angles
+    # ==========================================
     ocp.constraints.idxbx = np.array([2, 6, 7])
     ocp.constraints.lbx = np.array([-100.0, -max_angle, -max_angle])
-    ocp.constraints.ubx = np.array([0.0, max_angle, max_angle])
+    ocp.constraints.ubx = np.array([-0.5, max_angle, max_angle])
 
     ocp.constraints.idxbx_e = np.array([2, 6, 7])
     ocp.constraints.lbx_e = np.array([-100.0, -max_angle, -max_angle])
-    ocp.constraints.ubx_e = np.array([0.0, max_angle, max_angle])
+    ocp.constraints.ubx_e = np.array([-0.5, max_angle, max_angle])
 
     ocp.constraints.x0 = np.zeros(nx)
-
-    # --- IMPLEMENTING HARD NONLINEAR CONSTRAINTS ---
-    ocp.constraints.lh = np.zeros(5)
-    ocp.constraints.uh = 1e6 * np.ones(5)
-    ocp.constraints.lh_e = np.zeros(5)
-    ocp.constraints.uh_e = 1e6 * np.ones(5)
-
-    ocp.parameter_values = np.zeros(4)  # Initialize dynamic parameter vector
 
     ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'
     ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
@@ -406,9 +330,8 @@ if __name__ == "__main__":
     target_x_full, target_y_full, target_z_full = pts[:, 0], pts[:, 1], pts[:, 2]
 
     x_current = np.zeros(12)
-    x_current[0:3] = [8, 8, -1.5]  # Drone starts with a -1.0 offset from the car
+    x_current[0:3] = [9, -9, -4]
 
-    # Note: f_expl_expr does not depend on the parameter p, so we do not pass it here
     f_fun = ca.Function("f", [ll_model.x, ll_model.u], [ll_model.f_expl_expr])
 
     plt.ion()
@@ -446,8 +369,6 @@ if __name__ == "__main__":
     t_hl_arr = np.linspace(0, (N_hl - 1) * dt_hl, N_hl)
     t_ll_arr = np.linspace(0, (N_ll - 1) * dt_ll, N_ll)
 
-    landing_mode = False
-
     for i in range(N_sim):
         curr_target_x = target_x_full[i]
         curr_target_y = target_y_full[i]
@@ -456,168 +377,81 @@ if __name__ == "__main__":
         if i == 0:
             curr_vx, curr_vy, curr_vz = 0.0, 0.0, 0.0
             car_yaw = 0.0
-            car_omega = 0.0
+            curr_omega = 0.0
+        elif i == 1:
+            curr_vx = (target_x_full[i] - target_x_full[i - 1]) / dt_ll
+            curr_vy = (target_y_full[i] - target_y_full[i - 1]) / dt_ll
+            curr_vz = (target_z_full[i] - target_z_full[i - 1]) / dt_ll
+            car_yaw = np.arctan2(curr_vy, curr_vx)
+            curr_omega = 0.0
         else:
             curr_vx = (target_x_full[i] - target_x_full[i - 1]) / dt_ll
             curr_vy = (target_y_full[i] - target_y_full[i - 1]) / dt_ll
             curr_vz = (target_z_full[i] - target_z_full[i - 1]) / dt_ll
+            car_yaw = np.arctan2(curr_vy, curr_vx)
 
-            if curr_vx == 0 and curr_vy == 0:
-                car_yaw = 0.0
+            prev_vx = (target_x_full[i - 1] - target_x_full[i - 2]) / dt_ll
+            prev_vy = (target_y_full[i - 1] - target_y_full[i - 2]) / dt_ll
+            prev_yaw = np.arctan2(prev_vy, prev_vx) if (prev_vx != 0 or prev_vy != 0) else 0.0
+
+            yaw_diff = (car_yaw - prev_yaw + np.pi) % (2 * np.pi) - np.pi
+            curr_omega = yaw_diff / dt_ll
+
+        curr_v = np.hypot(curr_vx, curr_vy)
+
+        hl_x0 = np.array([x_current[0], x_current[1], x_current[2],
+                          x_current[3], x_current[4], x_current[5]])
+        hl_solver.set(0, "lbx", hl_x0)
+        hl_solver.set(0, "ubx", hl_x0)
+
+        for j in range(N_hl):
+            T = j * dt_hl
+            if abs(curr_omega) > 1e-4:
+                pred_x = curr_target_x + (curr_v / curr_omega) * (np.sin(car_yaw + curr_omega * T) - np.sin(car_yaw))
+                pred_y = curr_target_y + (curr_v / curr_omega) * (-np.cos(car_yaw + curr_omega * T) + np.cos(car_yaw))
+                pred_yaw = car_yaw + curr_omega * T
             else:
-                car_yaw = np.arctan2(curr_vy, curr_vx)
+                pred_x = curr_target_x + curr_v * T * np.cos(car_yaw)
+                pred_y = curr_target_y + curr_v * T * np.sin(car_yaw)
+                pred_yaw = car_yaw
 
-            if i == 1:
-                car_omega = 0.0
-            else:
-                prev_vx = (target_x_full[i - 1] - target_x_full[i - 2]) / dt_ll
-                prev_vy = (target_y_full[i - 1] - target_y_full[i - 2]) / dt_ll
-                prev_yaw = np.arctan2(prev_vy, prev_vx) if (prev_vx != 0 or prev_vy != 0) else 0.0
+            pred_z = curr_target_z + curr_vz * T
+            pred_vx = curr_v * np.cos(pred_yaw)
+            pred_vy = curr_v * np.sin(pred_yaw)
 
-                d_yaw = car_yaw - prev_yaw
-                d_yaw = (d_yaw + np.pi) % (2 * np.pi) - np.pi
-                car_omega = d_yaw / dt_ll
+            hl_solver.set(j, "p", np.array([pred_x, pred_y, pred_z, pred_yaw]))
 
-        v_speed = np.sqrt(curr_vx ** 2 + curr_vy ** 2)
-        eps = 1e-4
+            yref_hl = np.zeros(9)
+            yref_hl[0:3] = [pred_x, pred_y, pred_z - 0.75]
+            yref_hl[3:6] = [pred_vx, pred_vy, curr_vz]
+            hl_solver.set(j, "yref", yref_hl)
 
-        dx_w = x_current[0] - curr_target_x
-        dy_w = x_current[1] - curr_target_y
-        dz_w = x_current[2] - curr_target_z
-
-        dx_l = np.cos(car_yaw) * dx_w + np.sin(car_yaw) * dy_w
-        dy_l = -np.sin(car_yaw) * dx_w + np.cos(car_yaw) * dy_w
-
-        if not landing_mode and dx_l > -0.6 and dx_l < 0.6 and abs(dy_l) < 0.6 and abs(dz_w + 1.0) < 0.3:
-            landing_mode = True
-            print(f"Landing Phase Initiated at step {i}!")
-
-        if not landing_mode:
-            hl_x0 = np.array([x_current[0], x_current[1], x_current[2],
-                              x_current[3], x_current[4], x_current[5]])
-            hl_solver.set(0, "lbx", hl_x0)
-            hl_solver.set(0, "ubx", hl_x0)
-
-            for j in range(N_hl):
-                T_pred = j * dt_hl
-                if abs(car_omega) > eps:
-                    pred_x = curr_target_x + (v_speed / car_omega) * (
-                            np.sin(car_yaw + car_omega * T_pred) - np.sin(car_yaw))
-                    pred_y = curr_target_y + (v_speed / car_omega) * (
-                            -np.cos(car_yaw + car_omega * T_pred) + np.cos(car_yaw))
-                    pred_yaw = car_yaw + car_omega * T_pred
-                else:
-                    pred_x = curr_target_x + v_speed * T_pred * np.cos(car_yaw)
-                    pred_y = curr_target_y + v_speed * T_pred * np.sin(car_yaw)
-                    pred_yaw = car_yaw
-
-                pred_z = curr_target_z + curr_vz * T_pred
-                pred_vx = v_speed * np.cos(pred_yaw)
-                pred_vy = v_speed * np.sin(pred_yaw)
-
-                hl_solver.set(j, "p", np.array([pred_x, pred_y, pred_z, pred_yaw]))
-                yref_hl = np.zeros(9)
-                yref_hl[0:3] = [pred_x, pred_y, pred_z - 1.0]
-                yref_hl[3:6] = [pred_vx, pred_vy, curr_vz]
-                hl_solver.set(j, "yref", yref_hl)
-
-            T_pred_e = N_hl * dt_hl
-            if abs(car_omega) > eps:
-                pred_x_e = curr_target_x + (v_speed / car_omega) * (
-                        np.sin(car_yaw + car_omega * T_pred_e) - np.sin(car_yaw))
-                pred_y_e = curr_target_y + (v_speed / car_omega) * (
-                        -np.cos(car_yaw + car_omega * T_pred_e) + np.cos(car_yaw))
-                pred_yaw_e = car_yaw + car_omega * T_pred_e
-            else:
-                pred_x_e = curr_target_x + v_speed * T_pred_e * np.cos(car_yaw)
-                pred_y_e = curr_target_y + v_speed * T_pred_e * np.sin(car_yaw)
-                pred_yaw_e = car_yaw
-
-            pred_z_e = curr_target_z + curr_vz * T_pred_e
-            pred_vx_e = v_speed * np.cos(pred_yaw_e)
-            pred_vy_e = v_speed * np.sin(pred_yaw_e)
-
-            hl_solver.set(N_hl, "p", np.array([pred_x_e, pred_y_e, pred_z_e, pred_yaw_e]))
-            yref_hl_e = np.zeros(6)
-            yref_hl_e[0:3] = [pred_x_e, pred_y_e, pred_z_e - 1.0]
-            yref_hl_e[3:6] = [pred_vx_e, pred_vy_e, curr_vz]
-            hl_solver.set(N_hl, "yref", yref_hl_e)
-
-            hl_solver.solve()
-            hl_traj = np.zeros((N_hl, 6))
-            for j in range(N_hl):
-                hl_traj[j, :] = hl_solver.get(j, "x")
+        T_e = N_hl * dt_hl
+        if abs(curr_omega) > 1e-4:
+            pred_x_e = curr_target_x + (curr_v / curr_omega) * (np.sin(car_yaw + curr_omega * T_e) - np.sin(car_yaw))
+            pred_y_e = curr_target_y + (curr_v / curr_omega) * (-np.cos(car_yaw + curr_omega * T_e) + np.cos(car_yaw))
+            pred_yaw_e = car_yaw + curr_omega * T_e
         else:
-            hl_traj = np.zeros((N_hl, 6))
-            p_d_curr = x_current[0:3].copy()
-            v_d_curr = x_current[3:6].copy()
+            pred_x_e = curr_target_x + curr_v * T_e * np.cos(car_yaw)
+            pred_y_e = curr_target_y + curr_v * T_e * np.sin(car_yaw)
+            pred_yaw_e = car_yaw
 
-            Kp = np.array([2.0, 2.0])
-            Kd = np.array([1.0, 1.0])
-            Kpz = 1.0
-            Kdz = 0.5
-            r_safe = 0.5
-            alpha_cbf = 2.5
+        pred_z_e = curr_target_z + curr_vz * T_e
+        pred_vx_e = curr_v * np.cos(pred_yaw_e)
+        pred_vy_e = curr_v * np.sin(pred_yaw_e)
 
-            for j in range(N_hl):
-                T_pred = j * dt_hl
-                if abs(car_omega) > eps:
-                    pred_cx = curr_target_x + (v_speed / car_omega) * (
-                            np.sin(car_yaw + car_omega * T_pred) - np.sin(car_yaw))
-                    pred_cy = curr_target_y + (v_speed / car_omega) * (
-                            -np.cos(car_yaw + car_omega * T_pred) + np.cos(car_yaw))
-                    pred_cyaw = car_yaw + car_omega * T_pred
-                else:
-                    pred_cx = curr_target_x + v_speed * T_pred * np.cos(car_yaw)
-                    pred_cy = curr_target_y + v_speed * T_pred * np.sin(car_yaw)
-                    pred_cyaw = car_yaw
+        hl_solver.set(N_hl, "p", np.array([pred_x_e, pred_y_e, pred_z_e, pred_yaw_e]))
 
-                pred_cz = curr_target_z + curr_vz * T_pred
-                pred_cvx = v_speed * np.cos(pred_cyaw)
-                pred_cvy = v_speed * np.sin(pred_cyaw)
-                pred_cvz = curr_vz
+        yref_hl_e = np.zeros(6)
+        yref_hl_e[0:3] = [pred_x_e, pred_y_e, pred_z_e - 0.75]
+        yref_hl_e[3:6] = [pred_vx_e, pred_vy_e, curr_vz]
+        hl_solver.set(N_hl, "yref", yref_hl_e)
 
-                e_x = p_d_curr[0] - pred_cx
-                e_y = p_d_curr[1] - pred_cy
-                e_z = p_d_curr[2] - pred_cz
-                e_vx = v_d_curr[0] - pred_cvx
-                e_vy = v_d_curr[1] - pred_cvy
-                e_vz = v_d_curr[2] - pred_cvz
+        hl_solver.solve()
 
-                vd_x_des = pred_cvx - Kp[0] * e_x - Kd[0] * e_vx
-                vd_y_des = pred_cvy - Kp[1] * e_y - Kd[1] * e_vy
-
-                target_z_offset = -1.0
-                vd_z_des = pred_cvz - Kpz * (e_z - target_z_offset) - Kdz * e_vz
-                vd_z_safe = np.clip(vd_z_des, -0.6, 0.6)
-
-                A = np.array([2 * e_x, 2 * e_y])
-                b = 2 * e_x * pred_cvx + 2 * e_y * pred_cvy + alpha_cbf * (r_safe ** 2 - e_x ** 2 - e_y ** 2)
-
-                vd_des_2d = np.array([vd_x_des, vd_y_des])
-                A_dot_v = np.dot(A, vd_des_2d)
-
-                if A_dot_v <= b:
-                    vd_safe = vd_des_2d
-                else:
-                    norm_A_sq = np.dot(A, A)
-                    if norm_A_sq > 1e-6:
-                        vd_safe = vd_des_2d - ((A_dot_v - b) / norm_A_sq) * A
-                    else:
-                        vd_safe = vd_des_2d
-
-                v_norm = np.linalg.norm(vd_safe)
-                if v_norm > 4.0:
-                    vd_safe = (vd_safe / v_norm) * 4.0
-
-                v_d_curr[0] = vd_safe[0]
-                v_d_curr[1] = vd_safe[1]
-                v_d_curr[2] = vd_z_safe
-
-                p_d_curr += v_d_curr * dt_hl
-
-                hl_traj[j, 0:3] = p_d_curr
-                hl_traj[j, 3:6] = v_d_curr
+        hl_traj = np.zeros((N_hl, 6))
+        for j in range(N_hl):
+            hl_traj[j, :] = hl_solver.get(j, "x")
 
         ll_ref_x = np.interp(t_ll_arr, t_hl_arr, hl_traj[:, 0])
         ll_ref_y = np.interp(t_ll_arr, t_hl_arr, hl_traj[:, 1])
@@ -629,23 +463,7 @@ if __name__ == "__main__":
         ll_solver.set(0, "lbx", x_current)
         ll_solver.set(0, "ubx", x_current)
 
-        # --- DYNAMICALLY SETTING THE HARD CONSTRAINT FOR LOW-LEVEL ---
         for j in range(N_ll):
-            T_pred_ll = j * dt_ll
-            if abs(car_omega) > eps:
-                pred_cx = curr_target_x + (v_speed / car_omega) * (
-                        np.sin(car_yaw + car_omega * T_pred_ll) - np.sin(car_yaw))
-                pred_cy = curr_target_y + (v_speed / car_omega) * (
-                        -np.cos(car_yaw + car_omega * T_pred_ll) + np.cos(car_yaw))
-                pred_cyaw = car_yaw + car_omega * T_pred_ll
-            else:
-                pred_cx = curr_target_x + v_speed * T_pred_ll * np.cos(car_yaw)
-                pred_cy = curr_target_y + v_speed * T_pred_ll * np.sin(car_yaw)
-                pred_cyaw = car_yaw
-            pred_cz = curr_target_z + curr_vz * T_pred_ll
-
-            ll_solver.set(j, "p", np.array([pred_cx, pred_cy, pred_cz, pred_cyaw]))
-
             yref_ll = np.zeros(16)
             yref_ll[0:6] = [ll_ref_x[j], ll_ref_y[j], ll_ref_z[j],
                             ll_ref_vx[j], ll_ref_vy[j], ll_ref_vz[j]]
@@ -653,28 +471,11 @@ if __name__ == "__main__":
             yref_ll[12] = hover_thrust
             ll_solver.set(j, "yref", yref_ll)
 
-        # Terminal Node Parameter update
-        T_pred_ll_e = N_ll * dt_ll
-        if abs(car_omega) > eps:
-            pred_cx_e = curr_target_x + (v_speed / car_omega) * (
-                    np.sin(car_yaw + car_omega * T_pred_ll_e) - np.sin(car_yaw))
-            pred_cy_e = curr_target_y + (v_speed / car_omega) * (
-                    -np.cos(car_yaw + car_omega * T_pred_ll_e) + np.cos(car_yaw))
-            pred_cyaw_e = car_yaw + car_omega * T_pred_ll_e
-        else:
-            pred_cx_e = curr_target_x + v_speed * T_pred_ll_e * np.cos(car_yaw)
-            pred_cy_e = curr_target_y + v_speed * T_pred_ll_e * np.sin(car_yaw)
-            pred_cyaw_e = car_yaw
-        pred_cz_e = curr_target_z + curr_vz * T_pred_ll_e
-
-        ll_solver.set(N_ll, "p", np.array([pred_cx_e, pred_cy_e, pred_cz_e, pred_cyaw_e]))
-
         yref_ll_e = np.zeros(12)
         yref_ll_e[0:6] = [ll_ref_x[N_ll - 1], ll_ref_y[N_ll - 1], ll_ref_z[N_ll - 1],
                           ll_ref_vx[N_ll - 1], ll_ref_vy[N_ll - 1], ll_ref_vz[N_ll - 1]]
         yref_ll_e[8] = 0.0
         ll_solver.set(N_ll, "yref", yref_ll_e)
-
         ll_solver.solve()
 
         u0 = ll_solver.get(0, "u")
